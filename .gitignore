@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+__pycache__/
+.venv/
+venv/
+
+# Build outputs
+dist/
+build/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+.cache/
+
+# Lock files (keep project-specific ones)
+# bun.lock - keeping for reproducible builds
+# uv.lock - keeping for reproducible builds
+
+# Wrangler
+.wrangler/

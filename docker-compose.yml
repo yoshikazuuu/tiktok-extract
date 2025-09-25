@@ -1,0 +1,27 @@
+services:
+  api:
+    build: ./api
+    container_name: api
+    ports:
+      - "3000:3000"
+    depends_on:
+      - whisper-api
+    environment:
+      - WHISPER_API_URL=http://whisper-api:8000/transcribe
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
+    restart: unless-stopped
+  whisper-api:
+    build: ./whisper-api
+    container_name: whisper-api
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 2g
+    restart: unless-stopped
