@@ -1,6 +1,4 @@
 import { Hono } from 'hono';
-import { spawn } from 'child_process';
-import { promisify } from 'util';
 import { writeFile, unlink, readFile, mkdir, access } from 'fs/promises';
 import { join } from 'path';
 import { createHash } from 'crypto';
@@ -29,59 +27,56 @@ function getCacheKey(url: string): string {
   return createHash('sha256').update(url).digest('hex');
 }
 
-// yt-dlp response types
-interface YtDlpInfo {
+// tikwm API response types
+interface TikwmVideoInfo {
   id: string;
   title: string;
-  uploader: string;
+  author: {
+    unique_id: string;
+    nickname: string;
+  };
   duration: number;
-  url: string;
-  ext: string;
-  filesize?: number;
-  thumbnail: string;
-  description?: string;
+  play: string;
+  music: string;
+  cover: string;
+  origin_cover: string;
+  size: number;
+  wm_size: number;
+  hd_size: number;
+  wmplay: string;
+  hdplay: string;
 }
 
-// Helper function to execute yt-dlp and get video info
-async function getVideoInfo(videoUrl: string): Promise<YtDlpInfo> {
-  return new Promise((resolve, reject) => {
-    const ytDlp = spawn('yt-dlp', [
-      '--dump-json',
-      '--no-download',
-      videoUrl
-    ]);
-
-    let output = '';
-    let errorOutput = '';
-
-    ytDlp.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    ytDlp.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-    });
-
-    ytDlp.on('close', (code) => {
-      if (code === 0) {
-        try {
-          const info = JSON.parse(output.trim()) as YtDlpInfo;
-          resolve(info);
-        } catch (error) {
-          reject(new Error('Failed to parse yt-dlp output'));
-        }
-      } else {
-        reject(new Error(`yt-dlp failed: ${errorOutput}`));
-      }
-    });
-
-    ytDlp.on('error', (error) => {
-      reject(new Error(`Failed to spawn yt-dlp: ${error.message}`));
-    });
-  });
+interface TikwmResponse {
+  code: number;
+  msg: string;
+  processed_time: number;
+  data: TikwmVideoInfo;
 }
 
-// Helper function to download media with yt-dlp
+// Helper function to get video info from tikwm API
+async function getVideoInfo(videoUrl: string): Promise<TikwmVideoInfo> {
+  try {
+    const tikwmApiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(videoUrl)}&hd=1`;
+    const response = await fetch(tikwmApiUrl);
+
+    if (!response.ok) {
+      throw new Error(`tikwm API request failed: ${response.status} ${response.statusText}`);
+    }
+
+    const tikwmData = await response.json() as TikwmResponse;
+
+    if (tikwmData.code !== 0) {
+      throw new Error(`tikwm API error: ${tikwmData.msg}`);
+    }
+
+    return tikwmData.data;
+  } catch (error) {
+    throw new Error(`Failed to get video info from tikwm: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+// Helper function to download media from tikwm API
 async function downloadMedia(videoUrl: string, audioOnly: boolean = false): Promise<{ buffer: Buffer; filename: string; contentType: string; cached: boolean }> {
   await initCacheDir();
 
@@ -104,82 +99,52 @@ async function downloadMedia(videoUrl: string, audioOnly: boolean = false): Prom
     // File doesn't exist in cache, proceed with download
   }
 
-  const tempDir = '/tmp';
-  const timestamp = Date.now();
-  const outputTemplate = join(tempDir, `tiktok_${timestamp}.%(ext)s`);
+  try {
+    // Get video info first
+    const videoInfo = await getVideoInfo(videoUrl);
 
-  return new Promise((resolve, reject) => {
-    const args = [
-      '--no-playlist',
-      '-o', outputTemplate,
-    ];
-
+    // Choose download URL based on audioOnly preference
+    let downloadUrl: string;
     if (audioOnly) {
-      args.push(
-        '--extract-audio',
-        '--audio-format', 'mp3',
-        '--audio-quality', '128K'
-      );
+      downloadUrl = videoInfo.music; // Audio URL
     } else {
-      args.push(
-        '--format', 'best[ext=mp4]/best',
-        '--merge-output-format', 'mp4'
-      );
+      // Choose the best video quality available
+      downloadUrl = videoInfo.hdplay || videoInfo.play || videoInfo.wmplay;
     }
 
-    args.push(videoUrl);
+    if (!downloadUrl) {
+      throw new Error('No suitable download URL found');
+    }
 
-    const ytDlp = spawn('yt-dlp', args);
+    // Download the media file
+    const response = await fetch(downloadUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to download media: ${response.status} ${response.statusText}`);
+    }
 
-    let errorOutput = '';
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
-    ytDlp.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-    });
+    // Save to cache
+    try {
+      await writeFile(cachedFile, buffer);
+      console.log('Saved to cache:', cachedFile);
+    } catch (error) {
+      console.warn('Failed to save to cache:', error);
+    }
 
-    ytDlp.on('close', async (code) => {
-      if (code === 0) {
-        try {
-          // Find the downloaded file
-          const extension = audioOnly ? 'mp3' : 'mp4';
-          const expectedFile = join(tempDir, `tiktok_${timestamp}.${extension}`);
-
-          // Read the file
-          const fs = await import('fs/promises');
-          const buffer = await fs.readFile(expectedFile);
-
-          // Save to cache
-          try {
-            await writeFile(cachedFile, buffer);
-            console.log('Saved to cache:', cachedFile);
-          } catch (error) {
-            console.warn('Failed to save to cache:', error);
-          }
-
-          // Clean up temp file only (keep cache)
-          await fs.unlink(expectedFile).catch(() => { }); // Ignore cleanup errors
-
-          resolve({
-            buffer,
-            filename: `tiktok_${cacheKey}.${extension}`,
-            contentType: audioOnly ? 'audio/mp3' : 'video/mp4',
-            cached: false
-          });
-        } catch (error) {
-          reject(new Error(`Failed to read downloaded file: ${error}`));
-        }
-      } else {
-        reject(new Error(`yt-dlp download failed: ${errorOutput}`));
-      }
-    });
-
-    ytDlp.on('error', (error) => {
-      reject(new Error(`Failed to spawn yt-dlp: ${error.message}`));
-    });
-  });
+    return {
+      buffer,
+      filename: `tiktok_${cacheKey}.${extension}`,
+      contentType: audioOnly ? 'audio/mp3' : 'video/mp4',
+      cached: false
+    };
+  } catch (error) {
+    throw new Error(`Failed to download media: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
 }
 
-// The download endpoint using yt-dlp
+// The download endpoint using tikwm API
 app.post('/download', async (c) => {
   const { url } = await c.req.json();
   const hq = c.req.query('hq') === 'true';
@@ -192,9 +157,18 @@ app.post('/download', async (c) => {
     // Get video info first to get direct URL
     const info = await getVideoInfo(url);
 
-    // For download, redirect to the direct URL
-    // yt-dlp provides the best available URL
-    return c.redirect(info.url);
+    // For download, redirect to the best available video URL
+    let downloadUrl = info.hdplay || info.play || info.wmplay;
+
+    if (hq && info.hdplay) {
+      downloadUrl = info.hdplay;
+    }
+
+    if (!downloadUrl) {
+      throw new Error('No download URL available');
+    }
+
+    return c.redirect(downloadUrl);
 
   } catch (error) {
     console.error('Download error:', error);
@@ -231,7 +205,7 @@ app.post('/caption', async (c) => {
     const metadata = await getVideoInfo(url);
     timing.metadataEnd = Date.now();
 
-    console.log(`Got metadata for ${url}: ${metadata.title} by ${metadata.uploader}`);
+    console.log(`Got metadata for ${url}: ${metadata.title} by ${metadata.author.nickname}`);
 
     // 2. Download media using yt-dlp (audio or video)
     timing.downloadStart = Date.now();
@@ -275,12 +249,13 @@ app.post('/caption', async (c) => {
       caption: result.caption,
       metadata: {
         title: metadata.title,
-        author: metadata.uploader,
+        author: metadata.author.nickname,
+        authorId: metadata.author.unique_id,
         duration: metadata.duration,
         processingType: audioOnly ? 'audio-only' : 'video',
         fileSize: buffer.length,
-        thumbnail: metadata.thumbnail,
-        description: metadata.description,
+        thumbnail: metadata.cover,
+        originCover: metadata.origin_cover,
         cached: cached,
       },
       downloadUrl: `/download`,
@@ -365,53 +340,54 @@ app.post('/caption', async (c) => {
 
 app.get('/', (c) => {
   return c.text(`
-TikTok Video Transcription Service (Powered by yt-dlp)
+TikTok Video Transcription Service (Powered by tikwm.com API)
 
 Endpoints:
 - POST /caption - Get transcription of a TikTok video
-  - Body: { "url": "https://www.tiktok.com/@username/video/1234567890123456789" }
+  - Body: { "url": "https://www.tiktok.com/@mofuandmario/video/7550395062786477342" }
   - Optional: ?audio_only=true - Download only audio for faster processing (recommended)
   - Optional: ?debug=true - Include detailed timing and performance metrics
   - Returns: transcription + video metadata (title, author, duration, thumbnail, etc.)
   
 - POST /download - Download TikTok video
-  - Body: { "url": "https://www.tiktok.com/@username/video/1234567890123456789" }
-  - Uses yt-dlp for reliable video extraction
+  - Body: { "url": "https://www.tiktok.com/@mofuandmario/video/7550395062786477342" }
+  - Optional: ?hq=true - Download high-quality version if available
+  - Uses tikwm.com API for reliable video extraction
 
 Examples using curl:
 
 # Get transcription (audio-only, recommended for speed)
 curl -X POST "http://localhost:3000/caption?audio_only=true&debug=true" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.tiktok.com/@username/video/1234567890123456789"}'
+  -d '{"url": "https://www.tiktok.com/@mofuandmario/video/7550395062786477342"}'
 
 # Get transcription (audio-only, no debug info)
 curl -X POST "http://localhost:3000/caption?audio_only=true" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.tiktok.com/@username/video/1234567890123456789"}'
+  -d '{"url": "https://www.tiktok.com/@mofuandmario/video/7550395062786477342"}'
 
 # Get transcription (full video processing with debug)
 curl -X POST "http://localhost:3000/caption?debug=true" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.tiktok.com/@username/video/1234567890123456789"}'
+  -d '{"url": "https://www.tiktok.com/@mofuandmario/video/7550395062786477342"}'
 
-# Download video
-curl -X POST "http://localhost:3000/download" \
+# Download video (high quality)
+curl -X POST "http://localhost:3000/download?hq=true" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.tiktok.com/@username/video/1234567890123456789"}' \
+  -d '{"url": "https://www.tiktok.com/@mofuandmario/video/7550395062786477342"}' \
   -L -o "tiktok_video.mp4"
 
 Supported URL formats:
-✓ https://www.tiktok.com/@username/video/1234567890123456789
+✓ https://www.tiktok.com/@mofuandmario/video/7550395062786477342
 ✓ https://tiktok.com/@username/video/1234567890123456789
 ✓ https://vm.tiktok.com/ZMhvw8kQG/
 
-Benefits of yt-dlp over TikWM:
-✓ More reliable video extraction
-✓ Better metadata (title, author, thumbnail, description)
-✓ Direct audio extraction (no re-encoding)
-✓ Handles various TikTok URL formats
-✓ Active maintenance and updates
+Benefits of tikwm.com over yt-dlp:
+✓ No external dependencies required
+✓ Fast API-based extraction
+✓ Direct access to multiple quality options
+✓ Reliable video and audio extraction
+✓ No need for server-side tools installation
 
 Benefits of audio_only=true:
 ✓ Faster download (smaller file size)
@@ -426,8 +402,8 @@ Debug information includes:
 ✓ Percentage breakdown of time spent in each phase
 
 Requirements:
-- yt-dlp must be installed on the server
-- Install with: pip install yt-dlp
+- Internet connection for tikwm.com API access
+- No additional server dependencies needed
   `);
 });
 
